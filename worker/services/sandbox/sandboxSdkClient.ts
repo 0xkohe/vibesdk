@@ -107,7 +107,8 @@ function getAutoAllocatedSandbox(sessionId: string): string {
 export class SandboxSdkClient extends BaseSandboxService {
     private sandbox: SandboxType;
     private metadataCache = new Map<string, InstanceMetadata>();
-    
+    private allocatedPorts = new Map<string, number>();
+
     private envVars?: Record<string, string>;
 
     constructor(sandboxId: string, envVars?: Record<string, string>) {
@@ -199,23 +200,44 @@ export class SandboxSdkClient extends BaseSandboxService {
     }
 
     private async storeInstanceMetadata(instanceId: string, metadata: InstanceMetadata): Promise<void> {
-        await this.getSandbox().writeFile(this.getInstanceMetadataFile(instanceId), JSON.stringify(metadata));
-        this.metadataCache.set(instanceId, metadata); // Update cache
+        const metadataFile = this.getInstanceMetadataFile(instanceId);
+        const tmpFile = `${metadataFile}.tmp-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+
+        try {
+            await this.getSandbox().writeFile(tmpFile, JSON.stringify(metadata));
+            const renameResult = await this.getSandbox().exec(`mv "${tmpFile}" "${metadataFile}"`);
+
+            if (renameResult.exitCode !== 0) {
+                throw new Error(`Failed to rename metadata file: ${renameResult.stderr}`);
+            }
+
+            this.metadataCache.set(instanceId, metadata);
+        } catch (error) {
+            await this.getSandbox().exec(`rm -f "${tmpFile}"`).catch(() => {});
+            throw error;
+        }
     }
 
     private invalidateMetadataCache(instanceId: string): void {
         this.metadataCache.delete(instanceId);
     }
 
-    private async allocateAvailablePort(excludedPorts: number[] = [3000]): Promise<number> {
+    private async allocateAvailablePort(instanceId: string, excludedPorts: number[] = [3000]): Promise<number> {
+        if (this.allocatedPorts.has(instanceId)) {
+            const cachedPort = this.allocatedPorts.get(instanceId)!;
+            this.logger.info(`Using cached port for instance ${instanceId}: ${cachedPort}`);
+            return cachedPort;
+        }
+
         const startTime = Date.now();
-        const excludeList = excludedPorts.join(' ');
-        
+        const allExcludedPorts = [...excludedPorts, ...Array.from(this.allocatedPorts.values())];
+        const excludeList = allExcludedPorts.join(' ');
+
         // Single command to find first available port in dev range (8001-8999)
         const findPortCmd = `
             for port in $(seq 8001 8999); do
-                if ! echo "${excludeList}" | grep -q "\\\\b$port\\\\b" && 
-                   ! netstat -tuln 2>/dev/null | grep -q ":$port " && 
+                if ! echo "${excludeList}" | grep -q "\\\\b$port\\\\b" &&
+                   ! netstat -tuln 2>/dev/null | grep -q ":$port " &&
                    ! ss -tuln 2>/dev/null | grep -q ":$port "; then
                     echo $port
                     exit 0
@@ -223,17 +245,18 @@ export class SandboxSdkClient extends BaseSandboxService {
             done
             exit 1
         `;
-        
+
         const result = await this.getSandbox().exec(findPortCmd.trim());
         const endTime = Date.now();
         const duration = (endTime - startTime) / 1000;
         this.logger.info(`Port allocation took ${duration} seconds`);
         if (result.exitCode === 0 && result.stdout.trim()) {
             const port = parseInt(result.stdout.trim());
-            this.logger.info(`Allocated available port: ${port}`);
+            this.allocatedPorts.set(instanceId, port);
+            this.logger.info(`Allocated available port for instance ${instanceId}: ${port}`);
             return port;
         }
-        
+
         throw new Error('No available ports found in range 8001-8999');
     }
 
@@ -776,7 +799,7 @@ export class SandboxSdkClient extends BaseSandboxService {
                     // reject(new Error('Timeout waiting for cloudflared tunnel URL'));
                     this.logger.warn('Timeout waiting for cloudflared tunnel URL');
                     resolve('');
-                }, 20000); // 20 second timeout
+                }, 60000); // 60 second timeout
 
                 const processLogs = async () => {
                     try {
@@ -870,7 +893,7 @@ export class SandboxSdkClient extends BaseSandboxService {
             }
             
             // Allocate single port for both dev server and tunnel
-            const allocatedPort = await this.allocateAvailablePort();
+            const allocatedPort = await this.allocateAvailablePort(instanceId);
 
             // If on local development, start cloudflared tunnel
             let tunnelUrlPromise = Promise.resolve('');
@@ -895,9 +918,12 @@ export class SandboxSdkClient extends BaseSandboxService {
                     // Start dev server on allocated port
                     const processId = await this.startDevServer(instanceId, allocatedPort);
                     this.logger.info('Instance created successfully', { instanceId, processId, port: allocatedPort });
-                        
+
                     // Expose the same port for preview URL
+                    this.logger.info('Exposing port for preview', { instanceId, port: allocatedPort, hostname: getPreviewDomain(env) });
                     const previewResult = await sandbox.exposePort(allocatedPort, { hostname: getPreviewDomain(env) });
+                    this.logger.info('Port exposed successfully', { instanceId, port: allocatedPort, url: previewResult.url });
+
                     let previewURL = previewResult.url;
                     if (!isDev(env)) {
                         const previewDomain = getPreviewDomain(env);
@@ -911,8 +937,8 @@ export class SandboxSdkClient extends BaseSandboxService {
                         this.logger.info('Using tunnel url instead for preview as configured', { instanceId, tunnelURL });
                         previewURL = tunnelURL;
                     }
-                        
-                    this.logger.info('Preview URL exposed', { instanceId, previewURL });
+
+                    this.logger.info('Preview URL configured', { instanceId, previewURL, tunnelURL });
                         
                     return { previewURL, tunnelURL, processId, allocatedPort };
                 } catch (error) {
@@ -1175,7 +1201,13 @@ export class SandboxSdkClient extends BaseSandboxService {
                     this.logger.warn(`Failed to unexpose port ${metadata.allocatedPort}`, error);
                 }
             }
-            
+
+            // Release allocated port
+            if (this.allocatedPorts.has(instanceId)) {
+                this.allocatedPorts.delete(instanceId);
+                this.logger.info(`Released port allocation for instance ${instanceId}`);
+            }
+
             // Clean up files
             await sandbox.exec(`rm -rf /app/${instanceId}`);
 

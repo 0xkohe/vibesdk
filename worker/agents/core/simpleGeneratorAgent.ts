@@ -381,16 +381,27 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         return this.state.sessionId
     }
 
-    resetSessionId() {
+    async resetSessionId() {
+        // Clean up existing instance before resetting session
+        if (this.state.sandboxInstanceId && this.sandboxServiceClient) {
+            try {
+                this.logger().info(`Shutting down existing instance ${this.state.sandboxInstanceId} before session reset`);
+                await this.sandboxServiceClient.shutdownInstance(this.state.sandboxInstanceId);
+            } catch (error) {
+                this.logger().error(`Failed to shutdown instance during session reset: ${error}`);
+            }
+        }
+
         const newSessionId = generateId();
         this.logger().info(`New Sandbox sessionId initialized: ${newSessionId}`)
         this.setState({
             ...this.state,
-            sessionId: newSessionId
+            sessionId: newSessionId,
+            sandboxInstanceId: undefined
         })
         // Reset sandbox service client
         this.sandboxServiceClient = undefined;
-        
+
         // Clear health check interval since we're abandoning the old instance
         if (this.healthCheckInterval !== null) {
             clearInterval(this.healthCheckInterval);
@@ -1671,14 +1682,13 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         // Start the actual deployment and track it
         this.currentDeploymentPromise = this.executeDeployment(files, redeploy, commitMessage);
         
-        // Create timeout that resets session if deployment hangs
+        // Create timeout for deployment operations
         let timeoutId: ReturnType<typeof setTimeout> | null = null;
         const timeoutPromise = new Promise<never>((_, reject) => {
             timeoutId = setTimeout(() => {
-                this.logger().warn('Deployment timed out after 60 seconds, resetting sessionId to provision new sandbox instance');
-                this.resetSessionId();
-                reject(new Error('Deployment timed out after 60 seconds'));
-            }, 60000);
+                this.logger().warn('Deployment timed out after 120 seconds, but will not reset session - health check will handle any issues');
+                reject(new Error('Deployment timed out after 120 seconds'));
+            }, 120000);
         });
         
         try {
@@ -1863,7 +1873,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             const errorMsg = error instanceof Error ? error.message : String(error);
             if (errorMsg.includes('Network connection lost') || errorMsg.includes('Container service disconnected') || errorMsg.includes('Internal error in Durable Object storage')) {
                 // For this particular error, reset the sandbox sessionId
-                this.resetSessionId();
+                await this.resetSessionId();
             }
 
             this.setState({
